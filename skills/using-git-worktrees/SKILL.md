@@ -13,6 +13,64 @@ Git worktrees create isolated workspaces sharing the same repository, allowing w
 
 **Announce at start:** "I'm using the using-git-worktrees skill to set up an isolated workspace."
 
+## ⚠️ Critical: Working Directory Behavior
+
+**Claude Code's PWD does NOT change between tool calls.**
+
+**The scenario:** Claude Code starts in the main project directory. You create a worktree at `.worktrees/feat-auth`. Running `cd` does NOT move you to the worktree for future tool calls.
+
+**The solution:** Chain commands with `&&` to ensure they run in the worktree directory.
+
+```bash
+# ✅ Correct - chain commands together
+cd "$WORKTREE_PATH" && npm install && npm test
+
+# ❌ Wrong - cd doesn't persist
+cd "$WORKTREE_PATH"
+npm install  # Runs in original PWD, not worktree!
+```
+
+**For file operations (Read/Edit/Write tools):**
+- Use absolute paths: `$WORKTREE_PATH/src/file.js`
+- Or use relative paths if you understand where Claude Code's PWD is
+
+**Remember:** You are always in Claude Code's original PWD unless you chain commands with `&&`.
+
+## Pre-Flight Checks
+
+**CRITICAL: Always run these checks before creating a worktree.**
+
+### 1. Detect If Already In A Worktree
+
+```bash
+# Check if in a worktree by comparing git-dir vs git-common-dir
+# Works reliably from any subdirectory, not just repo root
+git_dir=$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)
+git_common_dir=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)
+
+if [[ -n "$git_dir" && -n "$git_common_dir" && "$git_dir" != "$git_common_dir" ]]; then
+    echo "⚠️  Already in a worktree. Navigating to main repository..."
+    main_repo=$(echo "$git_common_dir" | sed 's|/.git$||')
+    cd "$main_repo"
+    echo "Now in: $(pwd)"
+fi
+```
+
+**Why critical:** Creating a worktree from within another worktree causes nested creation at wrong paths.
+
+**Why this method:** Comparing `git-dir` vs `git-common-dir` works from any subdirectory. When in a worktree, these differ; in the main repository, they're identical. The old `[ -f .git ]` check only worked at the repository root.
+
+### 2. Detect Repository Type
+
+```bash
+# Check if this is a bare repository
+is_bare=$(git config --get core.bare 2>/dev/null)
+if [[ "$is_bare" == "true" ]]; then
+    echo "Note: This is a bare repository. All work must happen in worktrees."
+    echo "Primary workspace should be: .worktrees/main"
+fi
+```
+
 ## Directory Selection Process
 
 Follow this priority order:
@@ -80,53 +138,59 @@ No .gitignore verification needed - outside project entirely.
 project=$(basename "$(git rev-parse --show-toplevel)")
 ```
 
-### 2. Create Worktree
+### 2. Create Worktree and Capture Path
+
+**CRITICAL: Always use absolute paths to prevent nested worktree creation.**
 
 ```bash
-# Determine full path
+# Get absolute path to main repository
+main_repo=$(git rev-parse --show-toplevel)
+
+# Determine full worktree path (always absolute) and store in WORKTREE_PATH
 case $LOCATION in
   .worktrees|worktrees)
-    path="$LOCATION/$BRANCH_NAME"
+    WORKTREE_PATH="$main_repo/$LOCATION/$BRANCH_NAME"
     ;;
   ~/.config/superpowers/worktrees/*)
-    path="~/.config/superpowers/worktrees/$project/$BRANCH_NAME"
+    WORKTREE_PATH="$HOME/.config/superpowers/worktrees/$project/$BRANCH_NAME"
     ;;
 esac
 
-# Create worktree with new branch
-git worktree add "$path" -b "$BRANCH_NAME"
-cd "$path"
+# Create worktree with new branch using absolute path
+git worktree add "$WORKTREE_PATH" -b "$BRANCH_NAME"
 ```
 
-### 3. Run Project Setup
+**Why absolute paths:** Relative paths like `../.worktrees/` can create worktrees at wrong locations when already inside a worktree.
 
-Auto-detect and run appropriate setup:
+### 3. Run Project Setup (Chained Commands)
+
+Auto-detect and run appropriate setup using `&&` to chain commands:
 
 ```bash
 # Node.js
-if [ -f package.json ]; then npm install; fi
+cd "$WORKTREE_PATH" && [ -f package.json ] && npm install
 
 # Rust
-if [ -f Cargo.toml ]; then cargo build; fi
+cd "$WORKTREE_PATH" && [ -f Cargo.toml ] && cargo build
 
 # Python
-if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-if [ -f pyproject.toml ]; then poetry install; fi
+cd "$WORKTREE_PATH" && [ -f requirements.txt ] && pip install -r requirements.txt
+cd "$WORKTREE_PATH" && [ -f pyproject.toml ] && poetry install
 
 # Go
-if [ -f go.mod ]; then go mod download; fi
+cd "$WORKTREE_PATH" && [ -f go.mod ] && go mod download
 ```
 
-### 4. Verify Clean Baseline
+### 4. Verify Clean Baseline (Chained Commands)
 
 Run tests to ensure worktree starts clean:
 
 ```bash
-# Examples - use project-appropriate command
-npm test
-cargo test
-pytest
-go test ./...
+# Examples - use project-appropriate command (always chain with cd)
+cd "$WORKTREE_PATH" && npm test
+cd "$WORKTREE_PATH" && cargo test
+cd "$WORKTREE_PATH" && pytest
+cd "$WORKTREE_PATH" && go test ./...
 ```
 
 **If tests fail:** Report failures, ask whether to proceed or investigate.
@@ -154,6 +218,21 @@ Ready to implement <feature-name>
 | No package.json/Cargo.toml | Skip dependency install |
 
 ## Common Mistakes
+
+### Using relative paths for file operations
+
+- **Problem:** `Read: src/file.js` assumes you're "in" the worktree (you're not)
+- **Fix:** Always use absolute paths: `Read: $WORKTREE_PATH/src/file.js`
+
+### Expecting `cd` to persist across tool calls
+
+- **Problem:** Running `cd "$WORKTREE_PATH"` in one tool call doesn't affect the next
+- **Fix:** Chain commands: `cd "$WORKTREE_PATH" && npm test`
+
+### Not capturing worktree path in a variable
+
+- **Problem:** Hard to use absolute paths consistently without storing the path
+- **Fix:** Store path in `$WORKTREE_PATH` variable immediately after creation
 
 ### Skipping ignore verification
 
@@ -194,6 +273,11 @@ Ready to implement auth feature
 ## Red Flags
 
 **Never:**
+- Use relative paths for file operations (assumes you're "in" the worktree)
+- Expect `cd` to persist across tool calls
+- Create worktree from within another worktree (detect and navigate to main repo first)
+- Use relative paths like `../.worktrees/` for worktree operations (always use absolute paths)
+- Skip capturing worktree path in `$WORKTREE_PATH` variable
 - Create worktree without verifying it's ignored (project-local)
 - Skip baseline test verification
 - Proceed with failing tests without asking
@@ -201,6 +285,11 @@ Ready to implement auth feature
 - Skip CLAUDE.md check
 
 **Always:**
+- Run pre-flight checks: detect if in worktree, detect if bare repo
+- Use `$WORKTREE_PATH` for all file operations (Read/Edit/Write)
+- Chain commands with `&&` when running in worktree: `cd "$WORKTREE_PATH" && command`
+- Use absolute paths for all worktree creation
+- Capture worktree path in `$WORKTREE_PATH` variable immediately after creation
 - Follow directory priority: existing > CLAUDE.md > ask
 - Verify directory is ignored for project-local
 - Auto-detect and run project setup
@@ -209,10 +298,12 @@ Ready to implement auth feature
 ## Integration
 
 **Called by:**
-- **brainstorming** (Phase 4) - REQUIRED when design is approved and implementation follows
-- **subagent-driven-development** - REQUIRED before executing any tasks
-- **executing-plans** - REQUIRED before executing any tasks
-- Any skill needing isolated workspace
+- **brainstorming** (Phase 4) - OPTIONAL when isolation is needed for implementation
+- **subagent-driven-development** - OPTIONAL when isolation is required
+- **executing-plans** - OPTIONAL when isolation is required
+- Any skill needing isolated workspace under the same gate
 
 **Pairs with:**
-- **finishing-a-development-branch** - REQUIRED for cleanup after work complete
+- **finishing-a-development-branch** - REQUIRED for cleanup after work complete (if worktree was created)
+
+**Note:** Worktrees are now opt-in. Use when you need branch isolation. Skip for simple changes on main branch with explicit user consent.
